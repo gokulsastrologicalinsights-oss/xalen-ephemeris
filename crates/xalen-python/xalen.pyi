@@ -62,6 +62,32 @@ def rashi(sidereal_deg: float) -> str:
     """Rashi name, e.g. "Mesha (Aries)"."""
     ...
 
+def vimshottari_dasha(
+    moon_sidereal_deg: float, birth_jd: float, depth: int = ...
+) -> List[Dict[str, Any]]:
+    """Vimshottari Dasa-Bhukti periods: [{"lord", "level", "start_jd", "end_jd",
+    "duration_days", "duration_years", "sub_periods"}]."""
+    ...
+
+def kp_position(sidereal_deg: float) -> Dict[str, Any]:
+    """KP position: {"sign_lord", "star_lord", "sub_lord", "sub_sub_lord", "kp_number"}."""
+    ...
+
+def kp_number_to_sign(kp_number: int) -> int:
+    """Map KP number (1-249) to 1-based sign index (1=Aries, 12=Pisces)."""
+    ...
+
+
+def kp_cuspal_analysis(cusps: Any, planets: Any) -> List[Dict[str, Any]]:
+    """KP cuspal sub-lord analysis for 12 cusps: [{"house", "cusp_deg", "sign_lord",
+    "star_lord", "sub_lord", "promise"}]."""
+    ...
+
+def kp_significators(cusps: Any, planets: Any) -> List[Dict[str, Any]]:
+    """KP planet significators: [{"planet", "signified_houses", "strength_order"}]."""
+    ...
+
+
 def full_chart(
     jd: float, lat: float, lon: float, ayanamsa: int = ...
 ) -> Dict[str, Any]:

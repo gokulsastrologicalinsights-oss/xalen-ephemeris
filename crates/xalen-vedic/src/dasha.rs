@@ -29,13 +29,20 @@ pub fn vimshottari_dasha(
     birth_jd: f64,
     depth: DashaLevel,
 ) -> Vec<DashaPeriod> {
-    let nak = Nakshatra::from_longitude_deg(moon_sidereal_deg);
+    let norm_deg = moon_sidereal_deg.rem_euclid(360.0);
+    let nak = Nakshatra::from_longitude_deg(norm_deg);
     let starting_lord = nak.lord();
 
-    // Balance: fraction of nakshatra remaining at birth
-    let pos_in_nak = moon_sidereal_deg.rem_euclid(360.0) % (360.0 / 27.0);
-    let elapsed_fraction = pos_in_nak / (360.0 / 27.0);
-    let remaining_fraction = 1.0 - elapsed_fraction;
+    // Balance: fraction of nakshatra remaining at birth.
+    // Each nakshatra spans exactly 360° / 27 = 13° 20' = 13.333333333333334°.
+    // Use `(norm_deg - nak_start_deg).clamp(0.0, span)` to prevent IEEE 754
+    // remainder truncation artifacts at exact 40° integer boundary multiples
+    // (e.g. 40°, 80°, 120°) where `deg % span` evaluates to `span` instead of `0.0`.
+    const NAKSHATRA_SPAN: f64 = 360.0 / 27.0;
+    let nak_start_deg = (nak.index() as f64) * NAKSHATRA_SPAN;
+    let pos_in_nak = (norm_deg - nak_start_deg).clamp(0.0, NAKSHATRA_SPAN);
+    let elapsed_fraction = pos_in_nak / NAKSHATRA_SPAN;
+    let remaining_fraction = (1.0 - elapsed_fraction).clamp(0.0, 1.0);
 
     let start_idx = DashaLord::SEQUENCE
         .iter()
@@ -60,7 +67,20 @@ pub fn vimshottari_dasha(
         let end_jd = current_jd + duration_days;
 
         let sub_periods = if depth > DashaLevel::Mahadasha {
-            compute_sub_periods(lord, current_jd, end_jd, DashaLevel::Antardasha, depth)
+            if cycle == 0 {
+                let elapsed_fraction = 1.0 - remaining_fraction;
+                let theo_start = birth_jd - (full_years * elapsed_fraction * YEAR_IN_DAYS);
+                compute_sub_periods_clipped(
+                    lord,
+                    theo_start,
+                    end_jd,
+                    birth_jd,
+                    DashaLevel::Antardasha,
+                    depth,
+                )
+            } else {
+                compute_sub_periods(lord, current_jd, end_jd, DashaLevel::Antardasha, depth)
+            }
         } else {
             Vec::new()
         };
@@ -77,6 +97,80 @@ pub fn vimshottari_dasha(
     }
 
     periods
+}
+
+fn compute_sub_periods_clipped(
+    parent_lord: DashaLord,
+    parent_theo_start: f64,
+    parent_theo_end: f64,
+    birth_jd: f64,
+    current_level: DashaLevel,
+    target_depth: DashaLevel,
+) -> Vec<DashaPeriod> {
+    let parent_theo_dur = parent_theo_end - parent_theo_start;
+    let start_idx = DashaLord::SEQUENCE
+        .iter()
+        .position(|l| *l == parent_lord)
+        .expect("DashaLord must be in SEQUENCE");
+
+    let mut sub_periods = Vec::new();
+    let mut curr_theo_jd = parent_theo_start;
+
+    for i in 0..9 {
+        let lord = DashaLord::SEQUENCE[(start_idx + i) % 9];
+        let fraction = lord.vimshottari_years() / DashaLord::TOTAL_YEARS;
+        let c_theo_dur = if i == 8 {
+            parent_theo_end - curr_theo_jd
+        } else {
+            parent_theo_dur * fraction
+        };
+        let c_theo_end = if i == 8 { parent_theo_end } else { curr_theo_jd + c_theo_dur };
+        let c_theo_start = curr_theo_jd;
+        curr_theo_jd = c_theo_end;
+
+        if c_theo_end <= birth_jd + 1e-7 {
+            continue;
+        }
+
+        let (c_start, c_end, is_active) = if c_theo_start <= birth_jd && c_theo_end > birth_jd {
+            (birth_jd, c_theo_end, true)
+        } else {
+            (c_theo_start, c_theo_end, false)
+        };
+
+        let children = if target_depth > current_level {
+            if is_active {
+                compute_sub_periods_clipped(
+                    lord,
+                    c_theo_start,
+                    c_theo_end,
+                    birth_jd,
+                    next_level(current_level),
+                    target_depth,
+                )
+            } else {
+                compute_sub_periods(
+                    lord,
+                    c_start,
+                    c_end,
+                    next_level(current_level),
+                    target_depth,
+                )
+            }
+        } else {
+            Vec::new()
+        };
+
+        sub_periods.push(DashaPeriod {
+            lord,
+            start_jd: c_start,
+            end_jd: c_end,
+            level: current_level,
+            sub_periods: children,
+        });
+    }
+
+    sub_periods
 }
 
 fn compute_sub_periods(
@@ -364,5 +458,75 @@ mod tests {
         assert_eq!(lords[0], DashaLord::Ketu);
         assert_eq!(lords[1], DashaLord::Venus);
         assert_eq!(lords[2], DashaLord::Sun);
+    }
+
+    #[test]
+    fn regression_all_27_nakshatra_boundaries_and_neighbors() {
+        const SPAN: f64 = 360.0 / 27.0;
+        const J2000: f64 = 2451545.0;
+        const EPS: f64 = 1e-6;
+
+        for (i, nak) in Nakshatra::ALL.iter().enumerate() {
+            let exact_deg = (i as f64) * SPAN;
+            let expected_lord = nak.lord();
+            let full_years = expected_lord.vimshottari_years();
+
+            // 1. At exact boundary: must belong to nak, lord must match, balance must be full years (NOT 0.0)
+            let p_exact = vimshottari_dasha(exact_deg, J2000, DashaLevel::Mahadasha);
+            assert_eq!(p_exact.len(), 9);
+            let first_exact = &p_exact[0];
+            assert_eq!(
+                first_exact.lord, expected_lord,
+                "At exact boundary {exact_deg}°, expected lord {expected_lord:?} for {nak:?}, got {:?}",
+                first_exact.lord
+            );
+            let exact_years = (first_exact.end_jd - first_exact.start_jd) / YEAR_IN_DAYS;
+            assert!(
+                (exact_years - full_years).abs() < 1e-4,
+                "At exact boundary {exact_deg}° ({nak:?}), expected {full_years} years, got {exact_years}"
+            );
+            let total_days: f64 = p_exact.iter().map(|p| p.end_jd - p.start_jd).sum();
+            let total_years = total_days / YEAR_IN_DAYS;
+            assert!(
+                (total_years - 120.0).abs() < 0.01,
+                "Total cycle at boundary {exact_deg}° should be 120 years, got {total_years}"
+            );
+
+            // 2. Immediately above boundary (exact + EPS): remains in same nakshatra, balance slightly < full
+            let p_above = vimshottari_dasha(exact_deg + EPS, J2000, DashaLevel::Mahadasha);
+            let first_above = &p_above[0];
+            assert_eq!(first_above.lord, expected_lord);
+            let above_years = (first_above.end_jd - first_above.start_jd) / YEAR_IN_DAYS;
+            assert!(
+                above_years < full_years && above_years > full_years - 0.01,
+                "Above boundary {exact_deg}°, balance should be just below {full_years}, got {above_years}"
+            );
+
+            // 3. Immediately below boundary (exact - EPS): belongs to preceding nakshatra, balance near 0
+            let deg_below = exact_deg - EPS;
+            let p_below = vimshottari_dasha(deg_below, J2000, DashaLevel::Mahadasha);
+            let first_below = &p_below[0];
+            let prec_idx = (i + 26) % 27;
+            let prec_nak = Nakshatra::ALL[prec_idx];
+            let prec_lord = prec_nak.lord();
+            assert_eq!(
+                first_below.lord, prec_lord,
+                "Below boundary {exact_deg}°, expected preceding lord {prec_lord:?} for {prec_nak:?}, got {:?}",
+                first_below.lord
+            );
+            let below_years = (first_below.end_jd - first_below.start_jd) / YEAR_IN_DAYS;
+            assert!(
+                below_years > 0.0 && below_years < 0.01,
+                "Below boundary {exact_deg}°, balance should be near 0, got {below_years}"
+            );
+        }
+
+        // 4. Wrap tests: 360.0° and -360.0° must match 0.0° (Ashwini / Ketu, full 7 years)
+        for wrap_deg in [360.0, -360.0, 720.0] {
+            let p = vimshottari_dasha(wrap_deg, J2000, DashaLevel::Mahadasha);
+            assert_eq!(p[0].lord, DashaLord::Ketu);
+            let yrs = (p[0].end_jd - p[0].start_jd) / YEAR_IN_DAYS;
+            assert!((yrs - 7.0).abs() < 1e-4, "At {wrap_deg}°, expected 7.0 years, got {yrs}");
+        }
     }
 }

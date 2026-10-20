@@ -1,16 +1,28 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyDictMethods, PyListMethods};
+use pyo3::types::{PyDict, PyDictMethods, PyList, PyListMethods, PySequence};
 
 use xalen_ayanamsa::Ayanamsa;
 use xalen_coords::obliquity::mean_obliquity;
+use xalen_coords::Planet;
 use xalen_ephem::{Almanac, Body};
 use xalen_houses::{GeoLocation, HouseSystem, compute_houses};
 use xalen_time::{DeltaTModel, JdUT1, JulianDay};
+use xalen_vedic::dasha::{
+    DashaLevel, DashaPeriod, vimshottari_dasha as rust_vimshottari_dasha,
+};
+use xalen_vedic::kp::{
+    HousePromise, KpChart, SignificatorType,
+    compute_significators as rust_compute_significators,
+    cuspal_analysis as rust_cuspal_analysis,
+    kp_number_to_sign as rust_kp_number_to_sign,
+    kp_position as rust_kp_position,
+};
 use xalen_vedic::nakshatra::Nakshatra;
 use xalen_vedic::panchang::compute_panchang;
 use xalen_vedic::rashi::Rashi;
 
 mod swe_compat;
+
 
 // ---------------------------------------------------------------------------
 // ID-to-enum converters (mirrors xalen-wasm)
@@ -667,6 +679,353 @@ fn rashi(sidereal_deg: f64) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Vimshottari Dasa & KP (Krishnamurti Paddhati)
+// ---------------------------------------------------------------------------
+
+fn dasha_period_to_dict<'py>(
+    py: Python<'py>,
+    p: &DashaPeriod,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("lord", p.lord.to_string())?;
+    let level_str = match p.level {
+        DashaLevel::Mahadasha => "Mahadasha",
+        DashaLevel::Antardasha => "Antardasha",
+        DashaLevel::Pratyantardasha => "Pratyantardasha",
+        DashaLevel::Sookshmadasha => "Sookshmadasha",
+        DashaLevel::Pranadasha => "Pranadasha",
+    };
+    d.set_item("level", level_str)?;
+    d.set_item("start_jd", p.start_jd)?;
+    d.set_item("end_jd", p.end_jd)?;
+    let duration_days = p.end_jd - p.start_jd;
+    d.set_item("duration_days", duration_days)?;
+    d.set_item("duration_years", duration_days / 365.25)?;
+    let sub_list = PyList::empty(py);
+    for sub in &p.sub_periods {
+        sub_list.append(dasha_period_to_dict(py, sub)?)?;
+    }
+    d.set_item("sub_periods", sub_list)?;
+    Ok(d)
+}
+
+fn parse_kp_planet(obj: &Bound<'_, PyAny>) -> PyResult<Planet> {
+    if let Ok(id) = obj.extract::<i64>() {
+        return match id {
+            0 => Ok(Planet::Sun),
+            1 => Ok(Planet::Moon),
+            2 => Ok(Planet::Mercury),
+            3 => Ok(Planet::Venus),
+            4 => Ok(Planet::Mars),
+            5 => Ok(Planet::Jupiter),
+            6 => Ok(Planet::Saturn),
+            7 => Ok(Planet::Uranus),
+            8 => Ok(Planet::Neptune),
+            9 => Ok(Planet::Rahu),
+            10 => Ok(Planet::NorthNode),
+            11 => Ok(Planet::Pluto),
+            13 => Ok(Planet::Ketu),
+            _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "invalid planet id: {id}. Supported: 0=Sun, 1=Moon, 2=Mercury, 3=Venus, \
+                 4=Mars, 5=Jupiter, 6=Saturn, 7=Uranus, 8=Neptune, 9=Rahu, 10=NorthNode, \
+                 11=Pluto, 13=Ketu"
+            ))),
+        };
+    }
+    if let Ok(s) = obj.extract::<String>() {
+        return s.parse::<Planet>().map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("unknown planet name '{s}': {e}"))
+        });
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "planet must be a string name (e.g. 'Sun', 'Moon', 'Mars') or integer ID (0..13)",
+    ))
+}
+
+fn parse_planets_arg(planets: &Bound<'_, PyAny>) -> PyResult<Vec<(Planet, f64)>> {
+    let mut result = Vec::new();
+    if let Ok(dict) = planets.cast::<PyDict>() {
+        for (k, v) in dict.iter() {
+            let planet = parse_kp_planet(&k)?;
+            let deg = v.extract::<f64>().map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err(format!(
+                    "longitude for planet {planet} must be a float"
+                ))
+            })?;
+            check_finite(deg, &format!("{planet} longitude"))?;
+            result.push((planet, deg.rem_euclid(360.0)));
+        }
+        return Ok(result);
+    }
+    if let Ok(seq) = planets.cast::<PySequence>() {
+        let len = seq.len()?;
+        for i in 0..len {
+            let item = seq.get_item(i)?;
+            if let Ok(item_seq) = item.cast::<PySequence>() {
+                if item_seq.len()? != 2 {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "each planet entry in sequence must be a 2-tuple (planet, longitude), got length {}",
+                        item_seq.len()?
+                    )));
+                }
+                let p_obj = item_seq.get_item(0)?;
+                let d_obj = item_seq.get_item(1)?;
+                let planet = parse_kp_planet(&p_obj)?;
+                let deg = d_obj.extract::<f64>().map_err(|_| {
+                    pyo3::exceptions::PyTypeError::new_err(format!(
+                        "longitude for planet {planet} must be a float"
+                    ))
+                })?;
+                check_finite(deg, &format!("{planet} longitude"))?;
+                result.push((planet, deg.rem_euclid(360.0)));
+            } else {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "each planet entry must be a 2-tuple (planet, longitude)",
+                ));
+            }
+        }
+        return Ok(result);
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "planets must be a list/tuple of (planet, longitude) or a dict {planet: longitude}",
+    ))
+}
+
+fn parse_cusps_arg(cusps: &Bound<'_, PyAny>) -> PyResult<[f64; 12]> {
+    let seq = cusps.cast::<PySequence>().map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err("cusps must be a sequence of 12 float degrees")
+    })?;
+    let len = seq.len()?;
+    if len != 12 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "cusps must contain exactly 12 house cusp values, got {len}"
+        )));
+    }
+    let mut arr = [0.0_f64; 12];
+    for i in 0..12 {
+        let item = seq.get_item(i)?;
+        let deg = item.extract::<f64>().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(format!("cusp {} must be a float", i + 1))
+        })?;
+        check_finite(deg, &format!("cusp {}", i + 1))?;
+        arr[i] = deg.rem_euclid(360.0);
+    }
+    Ok(arr)
+}
+
+/// Compute the full Vimshottari dasha hierarchy from birth Moon sidereal longitude.
+///
+/// Parameters
+/// ----------
+/// moon_sidereal_deg : float
+///     Sidereal longitude of the Moon at birth in degrees [0, 360).
+/// birth_jd : float
+///     Julian Day of birth (UT1/UTC).
+/// depth : int, optional
+///     Nesting depth of dasha periods (default: 2 = Antardasha / Bhukti).
+///     1 = Mahadasha only
+///     2 = Mahadasha + Antardasha (Bhukti)
+///     3 = Mahadasha + Antardasha + Pratyantardasha
+///     4 = Up to Sookshmadasha
+///     5 = Up to Pranadasha
+///
+/// Returns
+/// -------
+/// list of dict
+///     List of 9 Mahadasha period dicts, each containing:
+///     - ``lord`` : str (e.g. "Ketu", "Venus", "Sun", ...)
+///     - ``level`` : str (e.g. "Mahadasha", "Antardasha")
+///     - ``start_jd`` : float (Julian Date of start)
+///     - ``end_jd`` : float (Julian Date of end)
+///     - ``duration_days`` : float (duration in days, based on 365.25 days/year)
+///     - ``duration_years`` : float (duration in years)
+///     - ``sub_periods`` : list of dict (nested sub-periods down to ``depth``)
+#[pyfunction]
+#[pyo3(signature = (moon_sidereal_deg, birth_jd, depth = 2))]
+fn vimshottari_dasha(
+    py: Python<'_>,
+    moon_sidereal_deg: f64,
+    birth_jd: f64,
+    depth: u8,
+) -> PyResult<Py<PyAny>> {
+    check_finite(moon_sidereal_deg, "moon_sidereal_deg")?;
+    check_jd(birth_jd)?;
+    let dasha_depth = match depth {
+        1 => DashaLevel::Mahadasha,
+        2 => DashaLevel::Antardasha,
+        3 => DashaLevel::Pratyantardasha,
+        4 => DashaLevel::Sookshmadasha,
+        5 => DashaLevel::Pranadasha,
+        _ => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "depth must be between 1 and 5 (1=Mahadasha, 2=Antardasha/Bhukti, 3=Pratyantardasha, 4=Sookshmadasha, 5=Pranadasha), got {depth}"
+            )));
+        }
+    };
+    let norm_moon = moon_sidereal_deg.rem_euclid(360.0);
+    let periods = rust_vimshottari_dasha(norm_moon, birth_jd, dasha_depth);
+    let py_list = PyList::empty(py);
+    for p in &periods {
+        py_list.append(dasha_period_to_dict(py, p)?)?;
+    }
+    Ok(py_list.into())
+}
+
+/// Compute KP (Krishnamurti Paddhati) lords and 249 sub-division number for a degree.
+///
+/// Parameters
+/// ----------
+/// sidereal_deg : float
+///     Sidereal longitude in degrees [0, 360).
+///
+/// Returns
+/// -------
+/// dict
+///     - ``sign_lord`` : str (e.g. "Mars", "Venus", "Mercury", ...)
+///     - ``star_lord`` : str (Nakshatra lord, e.g. "Ketu", "Venus", ...)
+///     - ``sub_lord`` : str (Sub-lord per Vimshottari proportions)
+///     - ``sub_sub_lord`` : str (Sub-sub-lord)
+///     - ``kp_number`` : int (1 to 249 in Krishnamurti's canonical horary table)
+#[pyfunction]
+fn kp_position(py: Python<'_>, sidereal_deg: f64) -> PyResult<Py<PyAny>> {
+    check_finite(sidereal_deg, "sidereal_deg")?;
+    let norm_deg = sidereal_deg.rem_euclid(360.0);
+    let pos = rust_kp_position(norm_deg);
+    let d = PyDict::new(py);
+    d.set_item("sign_lord", pos.sign_lord)?;
+    d.set_item("star_lord", pos.star_lord.to_string())?;
+    d.set_item("sub_lord", pos.sub_lord.to_string())?;
+    d.set_item("sub_sub_lord", pos.sub_sub_lord.to_string())?;
+    d.set_item("kp_number", pos.kp_number)?;
+    Ok(d.into())
+}
+
+/// Map a KP sub-division number (1-249) to its 1-based zodiac sign number.
+///
+/// Parameters
+/// ----------
+/// kp_number : int
+///     KP sub-division number in the range 1..249.
+///
+/// Returns
+/// -------
+/// int
+///     1-based zodiac sign number: 1=Aries, 2=Taurus, ..., 12=Pisces.
+#[pyfunction]
+fn kp_number_to_sign(kp_number: u16) -> PyResult<usize> {
+
+    if !(1..=249).contains(&kp_number) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "kp_number must be between 1 and 249, got {kp_number}"
+        )));
+    }
+    Ok(rust_kp_number_to_sign(kp_number))
+}
+
+/// Perform KP cuspal sub-lord analysis for all 12 house cusps.
+///
+/// Parameters
+/// ----------
+/// cusps : sequence of 12 floats
+///     Sidereal house cusp degrees [0, 360) for houses 1 through 12.
+/// planets : sequence of (planet, degree) or dict {planet: degree}
+///     Sidereal planet positions for Vedic grahas.
+///
+/// Returns
+/// -------
+/// list of dict
+///     List of 12 house cusp analysis dicts, each containing:
+///     - ``house`` : int (1 to 12)
+///     - ``cusp_deg`` : float (sidereal longitude in degrees)
+///     - ``sign_lord`` : str (sign ruler)
+///     - ``star_lord`` : str (nakshatra ruler)
+///     - ``sub_lord`` : str (sub-lord ruler)
+///     - ``promise`` : str ("Positive", "Negative", or "Mixed")
+#[pyfunction]
+fn kp_cuspal_analysis(
+    py: Python<'_>,
+    cusps: &Bound<'_, PyAny>,
+    planets: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let cusp_arr = parse_cusps_arg(cusps)?;
+    let planet_vec = parse_planets_arg(planets)?;
+    let results = rust_cuspal_analysis(&cusp_arr, &planet_vec);
+    let py_list = PyList::empty(py);
+    for c in results {
+        let d = PyDict::new(py);
+        d.set_item("house", c.house)?;
+        d.set_item("cusp_deg", c.cusp_deg)?;
+        d.set_item("sign_lord", c.sign_lord)?;
+        d.set_item("star_lord", c.star_lord.to_string())?;
+        d.set_item("sub_lord", c.sub_lord.to_string())?;
+        let promise_str = match c.promise {
+            HousePromise::Positive => "Positive",
+            HousePromise::Negative => "Negative",
+            HousePromise::Mixed => "Mixed",
+        };
+        d.set_item("promise", promise_str)?;
+        py_list.append(d)?;
+    }
+    Ok(py_list.into())
+}
+
+/// Compute the full KP significator table for planets in a chart.
+///
+/// Parameters
+/// ----------
+/// cusps : sequence of 12 floats
+///     Sidereal house cusp degrees [0, 360) for houses 1 through 12.
+/// planets : sequence of (planet, degree) or dict {planet: degree}
+///     Sidereal planet positions for Vedic grahas.
+///
+/// Returns
+/// -------
+/// list of dict
+///     List of 9 planet significator records, each containing:
+///     - ``planet`` : str (e.g. "Sun", "Moon", "Mars", ...)
+///     - ``signified_houses`` : list of int (deduplicated house numbers 1..12)
+///     - ``strength_order`` : list of dict ({"house": int, "type": str}),
+///       ordered strongest first: StarLord (Grade A), Occupant (Grade B),
+///       Owner (Grade D), Aspecting (Grade E).
+#[pyfunction]
+fn kp_significators(
+    py: Python<'_>,
+    cusps: &Bound<'_, PyAny>,
+    planets: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let cusp_arr = parse_cusps_arg(cusps)?;
+    let planet_vec = parse_planets_arg(planets)?;
+    let chart = KpChart {
+        cusps: cusp_arr,
+        planets: planet_vec,
+    };
+    let sigs = rust_compute_significators(&chart);
+    let py_list = PyList::empty(py);
+    for s in sigs {
+        let d = PyDict::new(py);
+        d.set_item("planet", s.planet.name())?;
+        d.set_item("signified_houses", s.signified_houses)?;
+        let strength_list = PyList::empty(py);
+        for (house, sig_type) in s.strength_order {
+            let item = PyDict::new(py);
+            item.set_item("house", house)?;
+            let type_str = match sig_type {
+                SignificatorType::StarLord => "StarLord",
+                SignificatorType::Occupant => "Occupant",
+                SignificatorType::Owner => "Owner",
+                SignificatorType::Aspecting => "Aspecting",
+            };
+            item.set_item("type", type_str)?;
+            strength_list.append(item)?;
+        }
+        d.set_item("strength_order", strength_list)?;
+        py_list.append(d)?;
+    }
+    Ok(py_list.into())
+}
+
+
+// ---------------------------------------------------------------------------
 // Houses
 // ---------------------------------------------------------------------------
 
@@ -1025,6 +1384,12 @@ fn xalen(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(nakshatra, m)?)?;
     m.add_function(wrap_pyfunction!(panchang, m)?)?;
     m.add_function(wrap_pyfunction!(rashi, m)?)?;
+    m.add_function(wrap_pyfunction!(vimshottari_dasha, m)?)?;
+    m.add_function(wrap_pyfunction!(kp_position, m)?)?;
+    m.add_function(wrap_pyfunction!(kp_number_to_sign, m)?)?;
+    m.add_function(wrap_pyfunction!(kp_cuspal_analysis, m)?)?;
+    m.add_function(wrap_pyfunction!(kp_significators, m)?)?;
+
 
     // Houses
     m.add_function(wrap_pyfunction!(houses, m)?)?;
@@ -1485,4 +1850,101 @@ mod tests {
             }
         });
     }
+
+    #[test]
+    fn test_vimshottari_dasha_python_binding() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            // Valid call at 0° (Ashwini), depth 2 (Mahadasha + Antardasha)
+            let obj = vimshottari_dasha(py, 0.0, 2_451_545.0, 2).expect("valid dasha");
+            let list = obj.bind(py).cast::<PyList>().expect("returns a list");
+            assert_eq!(list.len(), 9);
+
+            let first_d = list.get_item(0).unwrap();
+            let first = first_d.cast::<PyDict>().unwrap();
+            assert_eq!(first.get_item("lord").unwrap().unwrap().extract::<String>().unwrap(), "Ketu");
+            assert_eq!(first.get_item("level").unwrap().unwrap().extract::<String>().unwrap(), "Mahadasha");
+
+            let sub_periods_obj = first.get_item("sub_periods").unwrap().unwrap();
+            let sub_periods = sub_periods_obj.cast::<PyList>().unwrap();
+            assert_eq!(sub_periods.len(), 9, "depth=2 must produce 9 antardashas");
+
+            // Depth 1 should have empty sub_periods
+            let obj_depth1 = vimshottari_dasha(py, 0.0, 2_451_545.0, 1).expect("depth 1 valid");
+            let list_depth1 = obj_depth1.bind(py).cast::<PyList>().unwrap();
+            let first_d1_obj = list_depth1.get_item(0).unwrap();
+            let first_d1 = first_d1_obj.cast::<PyDict>().unwrap();
+            let subs_d1_obj = first_d1.get_item("sub_periods").unwrap().unwrap();
+            let subs_d1 = subs_d1_obj.cast::<PyList>().unwrap();
+            assert_eq!(subs_d1.len(), 0);
+
+            // Invalid inputs
+            assert!(vimshottari_dasha(py, f64::NAN, 2_451_545.0, 2).is_err());
+            assert!(vimshottari_dasha(py, 0.0, f64::INFINITY, 2).is_err());
+            assert!(vimshottari_dasha(py, 0.0, 2_451_545.0, 0).is_err(), "depth 0 must fail");
+            assert!(vimshottari_dasha(py, 0.0, 2_451_545.0, 6).is_err(), "depth 6 must fail");
+        });
+    }
+
+    #[test]
+    fn test_kp_position_python_binding() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let obj = kp_position(py, 0.0).expect("kp_position at 0");
+            let d = obj.bind(py).cast::<PyDict>().unwrap();
+            assert_eq!(d.get_item("sign_lord").unwrap().unwrap().extract::<String>().unwrap(), "Mars");
+            assert_eq!(d.get_item("star_lord").unwrap().unwrap().extract::<String>().unwrap(), "Ketu");
+            assert_eq!(d.get_item("sub_lord").unwrap().unwrap().extract::<String>().unwrap(), "Ketu");
+            assert_eq!(d.get_item("kp_number").unwrap().unwrap().extract::<u16>().unwrap(), 1);
+
+            // Non-finite input
+            assert!(kp_position(py, f64::NAN).is_err());
+        });
+    }
+
+    #[test]
+    fn test_kp_number_to_sign_python_binding() {
+        assert_eq!(kp_number_to_sign(1).unwrap(), 1); // 1 = Aries
+        assert_eq!(kp_number_to_sign(249).unwrap(), 12); // 12 = Pisces
+        assert!(kp_number_to_sign(0).is_err());
+        assert!(kp_number_to_sign(250).is_err());
+    }
+
+
+    #[test]
+    fn test_kp_cuspal_and_significators_python_binding() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let cusps_list = PyList::empty(py);
+            for i in 0..12 {
+                cusps_list.append((i as f64) * 30.0).unwrap();
+            }
+
+            let planets_dict = PyDict::new(py);
+            planets_dict.set_item("Sun", 15.0).unwrap();
+            planets_dict.set_item("Moon", 65.0).unwrap();
+            planets_dict.set_item("Mars", 280.0).unwrap();
+
+            // Cuspal analysis
+            let cusp_res = kp_cuspal_analysis(py, &cusps_list.as_any(), &planets_dict.as_any()).expect("cuspal analysis");
+            let c_list = cusp_res.bind(py).cast::<PyList>().unwrap();
+            assert_eq!(c_list.len(), 12);
+            let h1_obj = c_list.get_item(0).unwrap();
+            let h1 = h1_obj.cast::<PyDict>().unwrap();
+            assert_eq!(h1.get_item("house").unwrap().unwrap().extract::<usize>().unwrap(), 1);
+            assert_eq!(h1.get_item("sign_lord").unwrap().unwrap().extract::<String>().unwrap(), "Mars");
+
+
+            // Significators
+            let sig_res = kp_significators(py, &cusps_list.as_any(), &planets_dict.as_any()).expect("significators");
+            let s_list = sig_res.bind(py).cast::<PyList>().unwrap();
+            assert_eq!(s_list.len(), 9);
+
+            // Error cases: wrong cusp count
+            let bad_cusps = PyList::empty(py);
+            bad_cusps.append(10.0).unwrap();
+            assert!(kp_cuspal_analysis(py, &bad_cusps.as_any(), &planets_dict.as_any()).is_err());
+        });
+    }
 }
+
